@@ -1,25 +1,38 @@
 """
-PPT AI Agent - Generates HTML slides using AI and file creation tools
+PPT AI Agent - Generates slides using AI
+Supports two export modes:
+  - "native": Creates editable PPTX with real text boxes and shapes (default)
+  - "screenshot": Creates HTML slides, screenshots them, inserts as images into PPTX
+Uses OpenRouter API (OpenAI-compatible)
 """
 
-import anthropic
+from openai import OpenAI
 import os
+import json
 from typing import Dict, List
-from .tools import PPT_AGENT_TOOLS
+from .tools import PPT_AGENT_TOOLS, PPT_AGENT_NATIVE_TOOLS
 from .tool_executor import PPTToolExecutor
 from utils.screenshot import capture_slide_screenshots
 from utils.export import create_pptx_from_screenshots
+from utils.export_native import create_native_pptx
+
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+MODEL = "z-ai/glm-4.7"
 
 
 class PPTAgent:
-    """AI Agent that generates PowerPoint slides as HTML files"""
+    """AI Agent that generates PowerPoint slides"""
 
-    def __init__(self, api_key: str = None, progress_callback=None):
-        self.api_key = api_key or os.environ.get("ANTHROPIC_API_KEY")
-        self.client = anthropic.Anthropic(api_key=self.api_key)
+    def __init__(self, api_key: str = None, progress_callback=None, export_mode="native"):
+        self.api_key = api_key or os.environ.get("OPENROUTER_API_KEY")
+        self.client = OpenAI(
+            base_url=OPENROUTER_BASE_URL,
+            api_key=self.api_key
+        )
         self.tool_executor = PPTToolExecutor()
         self.messages = []
         self.progress_callback = progress_callback
+        self.export_mode = export_mode  # "native" or "screenshot"
 
     def _emit_progress(self, event_type: str, data: dict):
         """Emit a progress event if callback is set"""
@@ -27,43 +40,32 @@ class PPTAgent:
             self.progress_callback(event_type, data)
 
     def generate_presentation(self, ppt_data: Dict) -> Dict:
-        """
-        Generate a presentation based on the provided data
+        """Generate a presentation based on the provided data"""
 
-        Args:
-            ppt_data: Dictionary containing:
-                - ppt_topic: str
-                - ppt_description: str
-                - ppt_details: str
-                - ppt_data: str (optional)
-                - brand_logo_details: str (optional)
-                - brand_guideline_details: str (optional)
-                - brand_color_details: str (optional)
+        # Select system prompt and tools based on export mode
+        if self.export_mode == "native":
+            system_prompt = self._build_native_system_prompt()
+            tools = PPT_AGENT_NATIVE_TOOLS
+        else:
+            system_prompt = self._build_screenshot_system_prompt()
+            tools = PPT_AGENT_TOOLS
 
-        Returns:
-            Result dictionary with success status and slide information
-        """
-
-        # Build the initial prompt for the PPT Agent
-        system_prompt = self._build_system_prompt()
         user_prompt = self._build_user_prompt(ppt_data)
 
-        # Initialize conversation
         self.messages = [
             {"role": "user", "content": user_prompt}
         ]
 
         print("\n" + "="*60)
-        print("🤖 PPT AI Agent Started")
+        print(f"PPT AI Agent Started (mode: {self.export_mode})")
         print("="*60)
         print(f"\nGenerating presentation: {ppt_data['ppt_topic']}\n")
 
         self._emit_progress('agent_started', {
-            'message': f"🤖 PPT AI Agent Started",
+            'message': f"PPT AI Agent Started (mode: {self.export_mode})",
             'topic': ppt_data['ppt_topic']
         })
 
-        # Agent loop - continues until return_ppt_result is called
         max_iterations = 30
         iteration = 0
         final_result = None
@@ -73,50 +75,38 @@ class PPTAgent:
             print(f"\n--- Iteration {iteration} ---")
             self._emit_progress('iteration', {'iteration': iteration})
 
-            # Make API request
-            response = self.client.messages.create(
-                model="claude-sonnet-4-5-20250929",
+            response = self.client.chat.completions.create(
+                model=MODEL,
                 max_tokens=4000,
                 temperature=0,
-                system=system_prompt,
-                tools=PPT_AGENT_TOOLS,
-                tool_choice={"type": "any"},  # Force the model to use a tool
-                messages=self.messages
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    *self.messages
+                ],
+                tools=tools,
+                tool_choice="auto",
             )
 
-            # Check if agent wants to use tools
-            if response.stop_reason == "tool_use":
-                # Process tool use
-                tool_results = self._process_tool_use(response)
+            choice = response.choices[0]
 
-                # Check if agent returned final result
+            if choice.message.tool_calls:
+                tool_results = self._process_tool_use(choice.message)
+
                 if self._is_generation_complete(tool_results):
                     final_result = self._extract_final_result(tool_results)
 
-                    # Export to PPTX if generation was successful
-                    if final_result.get("success") and final_result.get("slide_files"):
+                    if final_result.get("success"):
                         final_result = self._export_to_pptx(final_result, ppt_data.get('ppt_topic', 'Presentation'))
 
                     break
 
-                # Add assistant message and tool results to conversation
-                self.messages.append({
-                    "role": "assistant",
-                    "content": response.content
-                })
-
-                self.messages.append({
-                    "role": "user",
-                    "content": tool_results
-                })
+                self.messages.append(choice.message)
+                for tool_result in tool_results:
+                    self.messages.append(tool_result)
 
             else:
-                # Agent finished without using tools (shouldn't happen in normal flow)
-                print("\n⚠️  Agent finished without calling return_ppt_result")
-                response_text = ""
-                for block in response.content:
-                    if hasattr(block, "text"):
-                        response_text += block.text
+                print("\nAgent finished without calling return_ppt_result")
+                response_text = choice.message.content or ""
 
                 final_result = {
                     "success": False,
@@ -127,7 +117,7 @@ class PPTAgent:
                 break
 
         if iteration >= max_iterations:
-            print("\n⚠️  Max iterations reached")
+            print("\nMax iterations reached")
             final_result = {
                 "success": False,
                 "message": "Max iterations reached without completion",
@@ -136,21 +126,90 @@ class PPTAgent:
             }
 
         print("\n" + "="*60)
-        print("✅ PPT AI Agent Finished")
+        print("PPT AI Agent Finished")
         print("="*60)
         print(f"Result: {final_result}\n")
 
         return final_result
 
-    def _build_system_prompt(self) -> str:
-        """Build the system prompt for the PPT Agent"""
+    def _build_native_system_prompt(self) -> str:
+        """System prompt for native editable PPTX mode"""
+        return """You are an expert presentation designer. You create slides using the create_slide_json tool, which produces native editable PowerPoint elements (text boxes, shapes, tables).
+
+=== COORDINATE SYSTEM ===
+- Slide dimensions: 10 inches wide x 5.625 inches tall (16:9 widescreen)
+- Origin: top-left corner (0, 0)
+- All position values are in INCHES
+- SAFE MARGINS: Keep content within 0.8" from all edges
+  - Usable area: left 0.8" to 9.2" (width 8.4"), top 0.8" to 4.825" (height 4.025")
+
+=== ELEMENT TYPES ===
+
+1. **text_box** - For all text content
+   - content: string for single line, or array for bullet points ["Point 1", "Point 2"]
+   - position: {left, top, width, height} in inches
+   - style: {font_name, font_size (in pt), font_bold, font_italic, font_color (#hex), alignment (left/center/right), background_color (#hex)}
+
+2. **shape** - Decorative elements and colored backgrounds
+   - shape_type: rectangle, rounded_rectangle, oval, circle, triangle, diamond, chevron, arrow_right
+   - position: {left, top, width, height} in inches
+   - style: {fill_color (#hex), line_color (#hex or null), line_width (pt)}
+   - text: optional text inside the shape
+   - style.text_style: {font_name, font_size, font_bold, font_color, alignment} for shape text
+
+3. **table** - Data tables
+   - data: 2D array [["Header1", "Header2"], ["Row1Col1", "Row1Col2"]]
+   - position: {left, top, width, height} in inches
+   - style: {header_color (#hex), header_font_color (#hex), font_size (pt)}
+
+=== DESIGN GUIDELINES ===
+
+**Typography (in points):**
+- Title: 36-44pt, bold
+- Subtitle: 20-24pt
+- Body text: 16-18pt
+- Small text: 12-14pt
+
+**Common Layouts:**
+
+Title Slide:
+- Colored background shape covering full slide: position {left: 0, top: 0, width: 10, height: 5.625}
+- Title text box centered: position {left: 1.5, top: 1.8, width: 7, height: 1.2}
+- Subtitle text box: position {left: 1.5, top: 3.2, width: 7, height: 0.8}
+
+Content Slide:
+- Title at top: position {left: 0.8, top: 0.5, width: 8.4, height: 0.8}
+- Accent bar: shape rectangle, position {left: 0.8, top: 1.3, width: 1.5, height: 0.06}
+- Body content: position {left: 0.8, top: 1.6, width: 8.4, height: 3.2}
+
+Two-Column:
+- Title: position {left: 0.8, top: 0.5, width: 8.4, height: 0.8}
+- Left column: position {left: 0.8, top: 1.6, width: 3.8, height: 3.2}
+- Right column: position {left: 5.2, top: 1.6, width: 3.8, height: 3.2}
+
+**Design Principles:**
+- Use shapes as colored accent bars, side panels, or background sections
+- Keep generous whitespace - do not cram content
+- Maximum 5-6 bullet points per slide
+- Use brand colors consistently
+- Better to have more slides with less content than fewer crowded slides
+
+=== WORKFLOW ===
+1. Call create_slide_json for EACH slide (one at a time)
+2. After ALL slides are created, call return_ppt_result with slide_files set to []
+
+START creating slides NOW using create_slide_json!
+"""
+
+    def _build_screenshot_system_prompt(self) -> str:
+        """System prompt for HTML/screenshot mode (original)"""
         return """You are an expert presentation designer who creates HTML slides that will be screenshotted and exported to PowerPoint.
 
 === CRITICAL TECHNICAL CONSTRAINTS ===
 
 **EXACT SLIDE DIMENSIONS (NON-NEGOTIABLE):**
 - Browser viewport: 1920x1080px (screenshots capture this exact viewport)
-- Use FULL viewport width and height (100vw × 100vh)
+- Use FULL viewport width and height (100vw x 100vh)
 - EVERYTHING must fit within the SAFEBOX AREA - NO SCROLLING, NO OVERFLOW
 - Safebox area: viewport minus padding (content must stay within this safe zone to prevent edge cutoff)
 
@@ -168,114 +227,40 @@ class PPTAgent:
 <body class="m-0 p-0 w-screen h-screen overflow-hidden">
     <div class="w-full h-full overflow-hidden flex items-center justify-center p-20">
         <!-- SAFEBOX AREA: All slide content goes here -->
-        <!-- Content MUST fit within this padded container -->
-        <!-- p-20 = 80px padding on all sides = safebox of ~1760px × ~920px -->
     </div>
 </body>
 </html>
 ```
 
-**SAFEBOX AREA CONCEPT (CRITICAL):**
-- Outer container: `w-screen h-screen` (100vw × 100vh = full viewport)
-- Inner container: Add `p-16` (64px) or `p-20` (80px) padding to create SAFEBOX
-- ALL content must fit within the safebox - prevents edge cutoff during screenshot
-- Safebox with p-20 padding: ~1760px wide × ~920px tall (usable area)
-- Think of safebox as your canvas boundaries - NEVER let content overflow outside it
-
 **TAILWIND CSS FIRST (MANDATORY):**
-- Use Tailwind utility classes for ALL styling (spacing, colors, layout, typography)
-- ONLY write custom CSS in base-styles.css for brand-specific styles (fonts, brand colors as CSS variables)
-- NO custom CSS in individual slide files - use Tailwind classes exclusively
-- NO inline styles - use Tailwind classes
+- Use Tailwind utility classes for ALL styling
+- ONLY write custom CSS in base-styles.css
+- NO custom CSS in individual slide files
+- NO inline styles
 
 **PREVENTING CONTENT OVERFLOW (CRITICAL):**
-1. **Container padding:** Use `p-16` or `p-20` (64-80px) on the main content container to ensure safe margins from all edges
-2. **Maximum content area:** With padding, your usable area is ~1760px wide × ~920px tall - design within this
-3. **Text sizing:** Headings max `text-6xl`, body text `text-xl` or `text-2xl`, ensure line-height doesn't cause overflow
-4. **List limits:** Maximum 5-6 bullet points per slide, use `space-y-4` or `space-y-6` for vertical spacing
-5. **Grid/Column layouts:** Use `grid grid-cols-2 gap-12` for two-column, ensure each column fits within ~450px height
-6. **Images/Icons:** Size appropriately - large icons `text-6xl`, images `max-h-[400px]`
-7. **Vertical space check:** Total height = padding-top + heading + spacing + content + spacing + padding-bottom ≤ 1080px
+1. Container padding: Use p-16 or p-20 (64-80px) on main content container
+2. Maximum content area: ~1760px wide x ~920px tall with p-20 padding
+3. Text sizing: Headings max text-6xl, body text text-xl or text-2xl
+4. List limits: Maximum 5-6 bullet points per slide
+5. Vertical space check: Total height <= 1080px
 
 **DESIGN PRINCIPLES:**
 - Think PowerPoint, not website: generous whitespace, limited content per slide
-- Prioritize readability: large text, clear hierarchy, strategic color use
 - Better to split into 2 slides than overflow 1 slide
-- Use flex/grid with `items-center` and `justify-center` for centering
-- Test mentally: "Will this fit comfortably in 1080px height?"
 
-=== WORKFLOW (FOLLOW IN ORDER) ===
+=== WORKFLOW ===
+1. Create base-styles.css FIRST
+2. Create individual slides
+3. Call return_ppt_result
 
-**Step 1: Create base-styles.css**
-- Define CSS custom properties for brand colors (--brand-primary, --brand-secondary, etc.)
-- Import brand fonts from Google Fonts if specified
-- Add minimal global styles (body reset only)
-- Keep it under 50 lines - Tailwind handles the rest
-
-Example base-styles.css:
-```css
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap');
-
-:root {
-  --brand-primary: #FF5722;
-  --brand-secondary: #333333;
-}
-
-body {
-  margin: 0;
-  padding: 0;
-  font-family: 'Inter', sans-serif;
-}
-```
-
-**Step 2: Create individual slides**
-- Use the exact HTML structure shown above for EVERY slide
-- Body must be: `<body class="m-0 p-0 w-screen h-screen overflow-hidden">`
-- Content container must be: `<div class="w-full h-full overflow-hidden flex items-center justify-center p-20">`
-- All content goes inside the p-20 container (this is your SAFEBOX)
-- Use only Tailwind classes for styling
-- Before creating each slide, verify content fits within ~1760px × ~920px safebox
-
-**Step 3: Call return_ppt_result**
-- Verify all slides use exact structure
-- Confirm no custom CSS in individual slides
-
-=== ABSOLUTE RULES ===
-✅ DO:
-1. Create base-styles.css FIRST before any slides
-2. Use viewport-based containers: body = `w-screen h-screen`, inner div = `w-full h-full`
-3. ALWAYS include `p-20` padding on the content container to create the SAFEBOX
-4. Use ONLY Tailwind classes for all styling (except base-styles.css)
-5. Keep ALL content within the safebox (~1760px × ~920px with p-20)
-6. Limit content quantity - better 10 clean slides than 5 overflowing slides
-7. Use Tailwind color classes or CSS variables from base-styles.css
-
-❌ DON'T:
-1. NO animations, transitions, hover effects, JavaScript
-2. NO custom CSS in individual slide files (only in base-styles.css)
-3. NO inline styles or <style> tags in slide HTML
-4. NO content overflow - if it doesn't fit, split into multiple slides
-5. NO cramming - respect whitespace and margins
-6. NO vague sizing - use exact Tailwind classes (p-20, text-4xl, etc.)
-
-**SAFEBOX OVERFLOW PREVENTION CHECKLIST:**
-Before creating each slide, verify:
-- [ ] Body uses `w-screen h-screen overflow-hidden`?
-- [ ] Content container uses `w-full h-full` with `p-20` padding (creates SAFEBOX)?
-- [ ] ALL content fits within safebox area (~1760px × ~920px with p-20)?
-- [ ] Total content height ≤ 920px (accounting for 80px top+bottom padding)?
-- [ ] Using Tailwind classes exclusively (no custom CSS in slide file)?
-- [ ] Heading + body + spacing fits comfortably within safebox?
-- [ ] No more than 5-6 list items to prevent vertical overflow?
-- [ ] Text sizes appropriate (headings ≤ text-6xl, body ≤ text-2xl)?
-- [ ] Content will NOT overflow beyond viewport edges when screenshotted?
+NO animations, transitions, hover effects, or JavaScript.
 
 START WITH base-styles.css NOW!
 """
 
     def _build_user_prompt(self, ppt_data: Dict) -> str:
         """Build the user prompt with PPT requirements"""
-
         prompt = f"""Please generate a presentation with the following details:
 
 **Topic**: {ppt_data['ppt_topic']}
@@ -291,45 +276,36 @@ START WITH base-styles.css NOW!
 """
         return prompt
 
-    def _process_tool_use(self, response) -> List[Dict]:
+    def _process_tool_use(self, message) -> List[Dict]:
         """Process tool use requests from the agent"""
-
         tool_results = []
 
-        for block in response.content:
-            if block.type == "tool_use":
-                tool_name = block.name
-                tool_input = block.input
+        for tool_call in message.tool_calls:
+            tool_name = tool_call.function.name
+            tool_input = json.loads(tool_call.function.arguments)
 
-                print(f"\n🔧 Tool: {tool_name}")
-                print(f"   Input: {tool_input}")
+            print(f"\nTool: {tool_name}")
+            print(f"   Input: {str(tool_input)[:300]}")
 
-                # Emit tool use event
-                self._emit_progress('tool_use', {
-                    'tool': tool_name,
-                    'input': tool_input
-                })
+            self._emit_progress('tool_use', {
+                'tool': tool_name,
+                'input': tool_input
+            })
 
-                # Execute the tool
-                result = self.tool_executor.execute_tool(tool_name, tool_input)
+            result = self.tool_executor.execute_tool(tool_name, tool_input)
 
-                print(f"   Result: {result[:200]}..." if len(result) > 200 else f"   Result: {result}")
+            print(f"   Result: {result[:200]}..." if len(result) > 200 else f"   Result: {result}")
 
-                # Emit tool result event
-                self._emit_progress('tool_result', {
-                    'tool': tool_name,
-                    'result': result[:200] if len(result) > 200 else result
-                })
+            self._emit_progress('tool_result', {
+                'tool': tool_name,
+                'result': result[:200] if len(result) > 200 else result
+            })
 
-                # Check if it's an error
-                is_error = result.startswith("Error:")
-
-                tool_results.append({
-                    "type": "tool_result",
-                    "tool_use_id": block.id,
-                    "content": result,
-                    "is_error": is_error
-                })
+            tool_results.append({
+                "role": "tool",
+                "tool_call_id": tool_call.id,
+                "content": result,
+            })
 
         return tool_results
 
@@ -342,12 +318,9 @@ START WITH base-styles.css NOW!
 
     def _extract_final_result(self, tool_results: List[Dict]) -> Dict:
         """Extract the final result from return_ppt_result"""
-        import json
-
         for result in tool_results:
             content = result.get("content", "")
             if "PPT_GENERATION_COMPLETE" in content:
-                # Extract JSON part
                 json_part = content.split("PPT_GENERATION_COMPLETE:")[1].strip()
                 return json.loads(json_part)
 
@@ -359,64 +332,76 @@ START WITH base-styles.css NOW!
         }
 
     def _export_to_pptx(self, result: Dict, presentation_title: str) -> Dict:
-        """
-        Export HTML slides to PPTX
-
-        Args:
-            result: Result dictionary from return_ppt_result
-            presentation_title: Title of the presentation
-
-        Returns:
-            Updated result dictionary with PPTX file path
-        """
+        """Export to PPTX - branches based on export mode"""
         try:
             print("\n" + "="*60)
-            print("📤 Exporting to PPTX")
+            print(f"Exporting to PPTX (mode: {self.export_mode})")
             print("="*60)
 
             self._emit_progress('export_started', {
-                'message': '📤 Exporting to PPTX'
+                'message': f'Exporting to PPTX (mode: {self.export_mode})'
             })
 
-            slide_files = result["slide_files"]
+            output_file = f"exports/{presentation_title.replace(' ', '_')}.pptx"
+
+            # Native mode: use slides_data JSON
+            if self.export_mode == "native" and result.get("slides_data"):
+                self._emit_progress('creating_pptx', {
+                    'message': 'Creating native editable PPTX...'
+                })
+
+                pptx_file = create_native_pptx(
+                    slides_data=result["slides_data"],
+                    output_file=output_file,
+                    presentation_title=presentation_title,
+                    progress_callback=self._emit_progress
+                )
+
+                result["pptx_file"] = pptx_file
+                self._emit_progress('export_complete', {
+                    'message': f'Native PPTX created: {pptx_file}'
+                })
+                return result
+
+            # Screenshot mode: capture HTML slides and insert as images
+            slide_files = result.get("slide_files", [])
+            if not slide_files:
+                print("No slide files to export")
+                return result
 
             self._emit_progress('capturing_screenshots', {
-                'message': '📸 Capturing screenshots...',
+                'message': 'Capturing screenshots...',
                 'slide_count': len(slide_files)
             })
 
-            # Capture screenshots
             screenshots = capture_slide_screenshots(slide_files, progress_callback=self._emit_progress)
 
             if not screenshots:
-                print("⚠️  No screenshots captured, skipping PPTX export")
+                print("No screenshots captured, skipping PPTX export")
                 return result
 
-            # Create PPTX
             self._emit_progress('creating_pptx', {
-                'message': '📊 Creating PPTX presentation...'
+                'message': 'Creating PPTX presentation...'
             })
 
             pptx_file = create_pptx_from_screenshots(
                 screenshots,
-                output_file=f"exports/{presentation_title.replace(' ', '_')}.pptx",
+                output_file=output_file,
                 presentation_title=presentation_title,
                 progress_callback=self._emit_progress
             )
 
-            # Add PPTX file to result
             result["pptx_file"] = pptx_file
             result["screenshots"] = screenshots
 
             self._emit_progress('export_complete', {
-                'message': f'✅ PPTX created: {pptx_file}'
+                'message': f'PPTX created: {pptx_file}'
             })
 
             return result
 
         except Exception as e:
-            print(f"❌ Error exporting to PPTX: {str(e)}")
+            print(f"Error exporting to PPTX: {str(e)}")
             import traceback
             traceback.print_exc()
-            # Return original result even if export fails
             return result

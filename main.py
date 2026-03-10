@@ -54,9 +54,9 @@ def interactive_mode():
     print_instructions()
 
     # Check for API key
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    api_key = os.environ.get("OPENROUTER_API_KEY")
     if not api_key:
-        print("❌ Error: ANTHROPIC_API_KEY not found in environment")
+        print("❌ Error: OPENROUTER_API_KEY not found in environment")
         print("   Please set it in your .env file")
         return
 
@@ -150,9 +150,9 @@ def quick_generate_mode(topic: str):
     print_banner()
     print(f"🚀 Quick Generate Mode: {topic}\n")
 
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    api_key = os.environ.get("OPENROUTER_API_KEY")
     if not api_key:
-        print("❌ Error: ANTHROPIC_API_KEY not found")
+        print("❌ Error: OPENROUTER_API_KEY not found")
         return
 
     Path("slides").mkdir(exist_ok=True)

@@ -12,6 +12,7 @@ class PPTToolExecutor:
 
     def __init__(self, base_path="."):
         self.base_path = Path(base_path)
+        self.slide_definitions = []  # For native mode: stores slide JSON data
 
     def execute_tool(self, tool_name: str, tool_input: dict) -> str:
         """Execute a tool and return the result"""
@@ -22,6 +23,7 @@ class PPTToolExecutor:
             "read_file": self.read_file,
             "update_file": self.update_file,
             "list_files": self.list_files,
+            "create_slide_json": self.create_slide_json,
             "return_ppt_result": self.return_ppt_result
         }
 
@@ -113,6 +115,21 @@ class PPTToolExecutor:
         except Exception as e:
             return f"Error listing files: {str(e)}"
 
+    def create_slide_json(self, tool_input: dict) -> str:
+        """Store a slide definition for native PPTX export"""
+        slide_number = tool_input.get("slide_number", len(self.slide_definitions) + 1)
+        elements = tool_input.get("elements", [])
+        background = tool_input.get("background", {})
+
+        slide_def = {
+            "slide_number": slide_number,
+            "background": background,
+            "elements": elements
+        }
+
+        self.slide_definitions.append(slide_def)
+        return f"Successfully created slide {slide_number} with {len(elements)} elements (native mode)"
+
     def return_ppt_result(self, tool_input: dict) -> str:
         """Return the final PPT generation result"""
         success = tool_input["success"]
@@ -126,6 +143,10 @@ class PPTToolExecutor:
             "slide_count": slide_count,
             "slide_files": slide_files
         }
+
+        # Include native slide data if available
+        if self.slide_definitions:
+            result["slides_data"] = self.slide_definitions
 
         # This is a special marker that the PPT Agent should stop
         return f"PPT_GENERATION_COMPLETE: {json.dumps(result)}"

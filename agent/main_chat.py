@@ -1,23 +1,32 @@
 """
 Main AI Chat - Interacts with user and orchestrates PPT generation
+Uses OpenRouter API (OpenAI-compatible)
 """
 
-import anthropic
+from openai import OpenAI
 import os
+import json
 import base64
 from typing import Dict, List, Optional
 from .tools import MAIN_CHAT_TOOLS
 from .ppt_agent import PPTAgent
 
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+MODEL = "z-ai/glm-4.7"
+
 
 class MainChat:
     """Main AI Chat that collects user requirements and generates presentations"""
 
-    def __init__(self, api_key: str = None, progress_callback=None):
-        self.api_key = api_key or os.environ.get("ANTHROPIC_API_KEY")
-        self.client = anthropic.Anthropic(api_key=self.api_key)
+    def __init__(self, api_key: str = None, progress_callback=None, export_mode="native"):
+        self.api_key = api_key or os.environ.get("OPENROUTER_API_KEY")
+        self.client = OpenAI(
+            base_url=OPENROUTER_BASE_URL,
+            api_key=self.api_key
+        )
         self.messages = []
         self.progress_callback = progress_callback
+        self.export_mode = export_mode  # "native" or "screenshot"
         self.ppt_agent = None  # Will be created with progress callback when needed
 
     def _emit_progress(self, event_type: str, data: dict):
@@ -40,7 +49,7 @@ class MainChat:
         self.messages = [first_message]
 
         print("\n" + "="*60)
-        print("💬 Main AI Chat Started")
+        print("Main AI Chat Started")
         print("="*60)
         print(f"\nYou: {initial_message}\n")
 
@@ -82,47 +91,46 @@ class MainChat:
             iteration += 1
 
             # Make API request
-            response = self.client.messages.create(
-                model="claude-sonnet-4-5-20250929",
+            response = self.client.chat.completions.create(
+                model=MODEL,
                 max_tokens=16000,
                 temperature=0,
-                system=self._get_system_prompt(),
+                messages=[
+                    {"role": "system", "content": self._get_system_prompt()},
+                    *self.messages
+                ],
                 tools=MAIN_CHAT_TOOLS,
-                messages=self.messages
             )
 
+            choice = response.choices[0]
+
             # Check if AI wants to use tools
-            if response.stop_reason == "tool_use":
+            if choice.finish_reason == "tool_calls" and choice.message.tool_calls:
                 # Process tool use
-                tool_results, ppt_generated = self._process_tool_use(response)
+                tool_results, ppt_generated = self._process_tool_use(choice.message)
 
                 # Add assistant response and tool results
-                self.messages.append({
-                    "role": "assistant",
-                    "content": response.content
-                })
+                self.messages.append(choice.message)
 
-                self.messages.append({
-                    "role": "user",
-                    "content": tool_results
-                })
+                # Add each tool result as a separate message
+                for tool_result in tool_results:
+                    self.messages.append(tool_result)
 
-                # If PPT was generated, we might want to show a special message
+                # If PPT was generated, continue to get AI's final response
                 if ppt_generated:
-                    # Continue to get AI's final response
                     continue
 
             else:
                 # AI gave a final response - extract and return it
-                response_text = self._extract_text_response(response)
+                response_text = choice.message.content or ""
 
                 # Add to conversation history
                 self.messages.append({
                     "role": "assistant",
-                    "content": response.content
+                    "content": response_text
                 })
 
-                print(f"🤖 AI: {response_text}\n")
+                print(f"AI: {response_text}\n")
                 return response_text
 
         # Max iterations reached
@@ -163,8 +171,7 @@ class MainChat:
         try:
             # Check if file exists
             if not os.path.exists(image_path):
-                print(f"⚠️  Image file not found: {image_path}")
-                print(f"   Please check the path and try again")
+                print(f"Image file not found: {image_path}")
                 return None
 
             # Determine media type
@@ -177,29 +184,27 @@ class MainChat:
             elif image_path.lower().endswith('.webp'):
                 media_type = "image/webp"
             else:
-                print(f"⚠️  Unsupported image format: {image_path}")
+                print(f"Unsupported image format: {image_path}")
                 return None
 
             # Read and encode
             with open(image_path, 'rb') as f:
                 image_data = base64.b64encode(f.read()).decode('utf-8')
 
-            print(f"✅  Successfully loaded image: {image_path}")
+            print(f"Successfully loaded image: {image_path}")
 
             return {
-                "type": "image",
-                "source": {
-                    "type": "base64",
-                    "media_type": media_type,
-                    "data": image_data
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:{media_type};base64,{image_data}"
                 }
             }
 
         except Exception as e:
-            print(f"⚠️  Error encoding image {image_path}: {str(e)}")
+            print(f"Error encoding image {image_path}: {str(e)}")
             return None
 
-    def _process_tool_use(self, response) -> tuple:
+    def _process_tool_use(self, message) -> tuple:
         """
         Process tool use requests
 
@@ -210,28 +215,25 @@ class MainChat:
         tool_results = []
         ppt_generated = False
 
-        for block in response.content:
-            if block.type == "tool_use":
-                tool_name = block.name
-                tool_input = block.input
+        for tool_call in message.tool_calls:
+            tool_name = tool_call.function.name
+            tool_input = json.loads(tool_call.function.arguments)
 
-                print(f"\n🔧 Using tool: {tool_name}")
+            print(f"\nUsing tool: {tool_name}")
 
-                # Execute the tool
-                if tool_name == "generate_ppt":
-                    result, ppt_generated = self._execute_generate_ppt(tool_input)
-                elif tool_name == "web_search":
-                    # Web search is server-side, we shouldn't need to execute it
-                    # This shouldn't happen, but handle it gracefully
-                    result = "Web search completed (server-side)"
-                else:
-                    result = f"Unknown tool: {tool_name}"
+            # Execute the tool
+            if tool_name == "generate_ppt":
+                result, ppt_generated = self._execute_generate_ppt(tool_input)
+            elif tool_name == "web_search":
+                result = f"Web search for '{tool_input.get('query', '')}' - this feature requires a web search API integration. Please provide the information directly."
+            else:
+                result = f"Unknown tool: {tool_name}"
 
-                tool_results.append({
-                    "type": "tool_result",
-                    "tool_use_id": block.id,
-                    "content": result
-                })
+            tool_results.append({
+                "role": "tool",
+                "tool_call_id": tool_call.id,
+                "content": result
+            })
 
         return tool_results, ppt_generated
 
@@ -244,17 +246,17 @@ class MainChat:
         """
 
         print("\n" + "-"*60)
-        print("📊 Triggering PPT Generation...")
+        print("Triggering PPT Generation...")
         print("-"*60)
 
         self._emit_progress('generate_ppt_started', {
-            'message': '📊 Triggering PPT Generation...',
+            'message': 'Triggering PPT Generation...',
             'topic': tool_input.get('ppt_topic', 'Unknown')
         })
 
         try:
             # Create PPT Agent with progress callback
-            self.ppt_agent = PPTAgent(api_key=self.api_key, progress_callback=self.progress_callback)
+            self.ppt_agent = PPTAgent(api_key=self.api_key, progress_callback=self.progress_callback, export_mode=self.export_mode)
 
             # Call the PPT Agent
             result = self.ppt_agent.generate_presentation(tool_input)
@@ -271,12 +273,12 @@ Files created: {', '.join(result['slide_files'])}
 """
                 # Add PPTX info if available
                 if result.get('pptx_file'):
-                    message += f"""📊 PPTX File: {result['pptx_file']}
+                    message += f"""PPTX File: {result['pptx_file']}
    You can open this file in PowerPoint or Keynote!
 
 """
 
-                message += """💡 You can also view individual HTML slides in your browser:
+                message += """You can also view individual HTML slides in your browser:
    Open any slide file (e.g., slides/slide_1.html) directly!
 """
                 return message, True
@@ -285,17 +287,6 @@ Files created: {', '.join(result['slide_files'])}
 
         except Exception as e:
             return f"Error generating presentation: {str(e)}", False
-
-    def _extract_text_response(self, response) -> str:
-        """Extract text from response content"""
-
-        text_parts = []
-
-        for block in response.content:
-            if hasattr(block, "text"):
-                text_parts.append(block.text)
-
-        return "\n".join(text_parts)
 
     def _get_system_prompt(self) -> str:
         """Get the system prompt for the main chat"""
@@ -307,9 +298,8 @@ Your role is to:
 2. Gather all necessary information about their presentation needs through back-and-forth conversation
 3. Ask clarifying questions to understand their requirements
 4. Collect optional brand information if available
-5. Use web search when you need current information
-6. Analyze any images provided for brand colors, logo details, design style
-7. Call the generate_ppt tool ONLY after you have asked questions AND received answers from the user
+5. Analyze any images provided for brand colors, logo details, design style
+6. Call the generate_ppt tool ONLY after you have asked questions AND received answers from the user
 
 CRITICAL - CONVERSATION FIRST:
 - DO NOT call generate_ppt on the first message
@@ -327,8 +317,6 @@ REQUIRED INFORMATION before calling generate_ppt:
 - brand_logo_details: Logo file path and description
 - brand_guideline_details: Brand tone, voice, style, fonts
 - Specific business details (fundraising amount, target audience, key metrics, etc.)
-- If the user doesnt provide data perform web search usiong the web_search tool to get required data
-- You can also use the websearch tool to get current brand guidleines data and any style insipiration ftom the brands website
 
 CRITICAL - IMAGE ANALYSIS:
 When the user provides images (logo, screenshots, etc.):
@@ -338,13 +326,12 @@ When the user provides images (logo, screenshots, etc.):
    - Design patterns and aesthetics
    - Typography and layout style
 2. INCLUDE this analysis in the brand_color_details, brand_logo_details, and brand_guideline_details
-3. Be specific: example - "Logo shows a blue shopping bag (#146EB4), clean modern sans-serif font, minimalist design" 
+3. Be specific: example - "Logo shows a blue shopping bag (#146EB4), clean modern sans-serif font, minimalist design"
 
 IMPORTANT GUIDELINES:
 - Be conversational and helpful
 - ALWAYS ask follow-up questions - don't assume you have enough information
 - When images are provided, analyze them but STILL ask questions about the content
-- Use web search to find current data if needed
 - Never rush to generate - take time to understand the user's needs fully
 - When calling generate_ppt, include detailed information gathered from conversation and image analysis
 

@@ -43,9 +43,9 @@ def get_or_create_session():
     session_id = session['session_id']
 
     if session_id not in chat_sessions:
-        api_key = os.environ.get("ANTHROPIC_API_KEY")
+        api_key = os.environ.get("OPENROUTER_API_KEY")
         if not api_key:
-            raise ValueError("ANTHROPIC_API_KEY not found in environment")
+            raise ValueError("OPENROUTER_API_KEY not found in environment")
         chat_sessions[session_id] = {
             'chat': MainChat(api_key=api_key),
             'messages': [],
@@ -110,7 +110,7 @@ def chat_stream():
             try:
                 # Create new chat instance with progress callback
                 chat_instance = MainChat(
-                    api_key=os.environ.get("ANTHROPIC_API_KEY"),
+                    api_key=os.environ.get("OPENROUTER_API_KEY"),
                     progress_callback=progress_callback
                 )
 
@@ -340,9 +340,9 @@ def main():
     Path("uploads").mkdir(exist_ok=True)
 
     # Check for API key
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    api_key = os.environ.get("OPENROUTER_API_KEY")
     if not api_key:
-        print("❌ Error: ANTHROPIC_API_KEY not found in environment")
+        print("❌ Error: OPENROUTER_API_KEY not found in environment")
         print("   Please set it in your .env file")
         return
 
