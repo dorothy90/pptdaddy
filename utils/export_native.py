@@ -3,6 +3,7 @@ Native PPTX export - Creates editable PowerPoint files with real text boxes, sha
 No screenshots involved - all elements are native python-pptx objects.
 """
 
+import logging
 from pathlib import Path
 from typing import Dict, List, Optional
 from pptx import Presentation
@@ -10,6 +11,8 @@ from pptx.util import Inches, Pt, Emu
 from pptx.dml.color import RGBColor
 from pptx.enum.text import PP_ALIGN, MSO_ANCHOR
 from pptx.enum.shapes import MSO_SHAPE
+
+logger = logging.getLogger(__name__)
 
 
 def _parse_color(hex_str: str) -> RGBColor:
@@ -60,7 +63,8 @@ def _add_text_box(slide, element: Dict, prs):
     # Vertical alignment
     v_align = style.get('vertical_alignment', 'top')
     if v_align == 'middle':
-        tf.paragraphs[0].alignment = _get_alignment(style.get('alignment', 'left'))
+        txBox.text_frame.paragraphs[0].alignment = _get_alignment(style.get('alignment', 'left'))
+        tf.vertical_anchor = MSO_ANCHOR.MIDDLE
 
     # Handle content - can be string or list of paragraphs
     content = element.get('content', '')
@@ -170,6 +174,9 @@ def _add_table(slide, element: Dict, prs):
     rows = len(data)
     cols = len(data[0]) if data else 1
 
+    if rows > 10:
+        logger.warning(f"Table has {rows} rows (>10), may overflow slide")
+
     table_shape = slide.shapes.add_table(rows, cols, left, top, width, height)
     table = table_shape.table
 
@@ -204,8 +211,13 @@ def _add_image(slide, element: Dict, prs):
     height = Inches(pos['height'])
 
     image_path = element.get('image_path', '')
-    if image_path and Path(image_path).exists():
-        slide.shapes.add_picture(image_path, left, top, width, height)
+    if not image_path:
+        logger.warning("Image element missing 'image_path'")
+        return
+    if not Path(image_path).exists():
+        logger.warning(f"Image file not found: {image_path}")
+        return
+    slide.shapes.add_picture(image_path, left, top, width, height)
 
 
 def _set_background(slide, bg_def: Dict):
@@ -244,7 +256,7 @@ def _add_slide(prs, slide_def: Dict):
             try:
                 handler(slide, element, prs)
             except Exception as e:
-                print(f"   Warning: Failed to add {elem_type}: {e}")
+                logger.warning(f"Failed to add {elem_type}: {e}", exc_info=True)
 
 
 def create_native_pptx(
@@ -285,7 +297,7 @@ def create_native_pptx(
                     'total_slides': len(slides_data)
                 })
         except Exception as e:
-            print(f"   Error adding slide {i}: {e}")
+            logger.warning(f"Error adding slide {i}: {e}", exc_info=True)
 
     prs.save(str(output_path))
 
